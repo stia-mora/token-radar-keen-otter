@@ -87,6 +87,53 @@ export const MODEL: ModelConstants = {
 /** The model's version label: the dashboard names it. */
 export const MODEL_VERSION = 'radar-2';
 
+/**
+ * A category's calibration, computed at runtime from the snapshot
+ * itself — never from a hardcoded list of names. It answers one
+ * question per row: how does this protocol's TVL compare with the
+ * other protocols in its own category? A lending protocol at $200M
+ * is large for lending; the same TVL in a DEX category is middling.
+ * The calibration never changes a row's score or rank: it is shown
+ * beside the model breakdown so a reader can see the context the
+ * log-size score already used, in the category's own terms.
+ */
+export interface CategoryCalibration {
+  category: string;
+  protocol_count: number;
+  median_tvl_usd: number;
+  mean_tvl_usd: number;
+}
+
+/** The median of a sorted list of numbers, or 0 for an empty list. */
+export function medianOf(sorted: number[]): number {
+  if (sorted.length === 0) return 0;
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid]! : Math.round((sorted[mid - 1]! + sorted[mid]!) / 2);
+}
+
+/** One calibration entry per category present in the snapshot. */
+export function categoryCalibrations(protocols: SnapshotProtocol[]): Map<string, CategoryCalibration> {
+  const byCategory = new Map<string, number[]>();
+  for (const p of protocols) {
+    const key = p.category ?? 'Other';
+    const list = byCategory.get(key);
+    if (list === undefined) byCategory.set(key, [p.tvl_usd]);
+    else list.push(p.tvl_usd);
+  }
+  const out = new Map<string, CategoryCalibration>();
+  for (const [category, tvls] of byCategory) {
+    const sorted = [...tvls].sort((a, b) => a - b);
+    const total = sorted.reduce((sum, v) => sum + v, 0);
+    out.set(category, {
+      category,
+      protocol_count: sorted.length,
+      median_tvl_usd: medianOf(sorted),
+      mean_tvl_usd: Math.round(total / sorted.length),
+    });
+  }
+  return out;
+}
+
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
 
@@ -122,6 +169,9 @@ export interface BoardRow {
     composite_score: number;
     growth_pct: number;
     age_days: number | null;
+    category_median_tvl_usd: number;
+    category_protocol_count: number;
+    tvl_vs_category_median: number;
   };
   farm_steps: string[];
 }
@@ -145,6 +195,9 @@ export interface RadarRow {
   age_score: number;
   breadth_score: number;
   composite_score: number;
+  category_median_tvl_usd: number;
+  category_protocol_count: number;
+  tvl_vs_category_median: number;
   farm_steps: string[];
 }
 
@@ -271,12 +324,21 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     if (!chosen.has(p.slug) && isRankable(p)) chosen.set(p.slug, p);
   }
 
+  // Calibration is computed from the whole snapshot, before any
+  // ranking, so a row's category context is the same whichever
+  // rank it lands on. It is descriptive only: the sort below uses
+  // implied value alone, exactly as before.
+  const calibrations = categoryCalibrations(snapshot.protocols);
   const scored = [...chosen.values()].map((p) => {
     const v = impliedValue(p, snapshot.as_of, model);
     return { p, v };
   });
   scored.sort((a, b) => b.v.implied - a.v.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
+  return scored.map((s, i) => {
+    const calibration = calibrations.get(s.p.category ?? 'Other');
+    const medianTvl = calibration?.median_tvl_usd ?? 0;
+    const vsMedian = medianTvl > 0 ? Math.round((s.p.tvl_usd / medianTvl) * 100) / 100 : 0;
+    return {
     rank: i + 1,
     slug: s.p.slug,
     name: s.p.name,
@@ -300,9 +362,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       composite_score: round4(s.v.composite),
       growth_pct: s.v.growthPct,
       age_days: s.v.age,
+      category_median_tvl_usd: medianTvl,
+      category_protocol_count: calibration?.protocol_count ?? 0,
+      tvl_vs_category_median: vsMedian,
     },
     farm_steps: farmSteps(s.p, s.v.age).map(stepText),
-  }));
+  };
+  });
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -389,6 +455,49 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
 }
 
 /**
+ * The farm plan's second, category-specific variant step: the weekly
+ * qualifying action is not the same for a lender, a DEX, a bridge
+ * and a curator, so the plan names the one that counts for this
+ * protocol's category. The generic weekly action stays in the
+ * opening deposit step; this step is the repeatable one a farmer
+ * actually does every week. Categories are matched by substring,
+ * never by protocol name, so a new protocol in a known category
+ * gets the right variant without any list of names.
+ */
+export function variantStepFor(p: SnapshotProtocol, capital: number, chain: string): string {
+  const c = (p.category ?? '').toLowerCase();
+  const name = p.name;
+  if (c.includes('risk curator') || c.includes('capital allocator') || c.includes('allocator') || c.includes('curator')) {
+    return `Each week, move a small slice of the vault position into the curator's newest vault on ${chain} and leave the rest compounding, so the wallet shows fresh allocation decisions, not one stale deposit.`;
+  }
+  if (c.includes('uncollateralized lend') || c.includes('lend') || c.includes('cdp') || c.includes('collateral')) {
+    return `Each week, repay a small part of the borrow on ${name} and re-borrow it the same day, keeping the health factor above 2, so the wallet shows live lending activity in every snapshot.`;
+  }
+  if (c.includes('dex') || c.includes('liquidity manager') || c.includes('leveraged farm')) {
+    return `Each week, rebalance the ${name} pool position on ${chain} into the current price range and collect the fees, so the wallet shows an active liquidity provider, not a forgotten deposit.`;
+  }
+  if (c.includes('yield aggregator') || c.includes('yield')) {
+    return `Each week, harvest the vault rewards on ${name} and redeposit them into the same vault on ${chain}, so the wallet compounds instead of sitting idle.`;
+  }
+  if (c.includes('rwa')) {
+    return `Each week, check the yield-bearing asset's accrual on ${name} and top it up by a small amount on ${chain}, so the wallet shows a growing holding, not a one-off mint.`;
+  }
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('basis trading')) {
+    return `Each week, close the small hedged position on ${name} and open a fresh one at the same size on ${chain}, so the wallet shows repeated trading activity without raising the leverage.`;
+  }
+  if (c.includes('prediction')) {
+    return `Each week, place one small position in a fresh market on ${name} that settles after the farming window, so the wallet shows steady participation, not a single bet.`;
+  }
+  if (c.includes('bridge')) {
+    return `Each week, bridge a small amount of USDC through ${name} to ${chain} and use it in the destination app the same week, so the wallet shows the bridge being used, not just tested once.`;
+  }
+  if (c.includes('restak') || c.includes('staking')) {
+    return `Each week, claim the staking rewards on ${name} and restake them on ${chain}, so the wallet shows compounding stake rather than a single deposit.`;
+  }
+  return `Make one qualifying action each week on ${chain}, such as a deposit, a borrow, a swap or a vote, so the wallet looks active in every snapshot.`;
+}
+
+/**
  * A protocol's farm plan: seven steps, each an action with a cost and a
  * time. The plan is derived from the protocol's own record (category,
  * chains, TVL, age), never from a hand-written list of names.
@@ -412,7 +521,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '15 minutes to set up',
     },
     {
-      text: `Make one qualifying action each week on ${chain}, such as a deposit, a borrow, a swap or a vote, so the wallet looks active in every snapshot.${chainsText}`,
+      text: `${variantStepFor(p, capital, chain)}${chainsText}`,
       cost: `${gas} a week`,
       time: '10 minutes a week',
     },
@@ -476,6 +585,9 @@ export function radarRow(row: BoardRow): RadarRow {
     age_score: row.model.age_score,
     breadth_score: row.model.breadth_score,
     composite_score: row.model.composite_score,
+    category_median_tvl_usd: row.model.category_median_tvl_usd,
+    category_protocol_count: row.model.category_protocol_count,
+    tvl_vs_category_median: row.model.tvl_vs_category_median,
     farm_steps: row.farm_steps,
   };
 }

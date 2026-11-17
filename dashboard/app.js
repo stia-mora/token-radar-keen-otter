@@ -112,6 +112,68 @@
     });
   }
 
+  /** One CSV cell: quote it when it carries a comma, a quote or a newline. */
+  function csvCell(value) {
+    var s = value === null || value === undefined ? '' : String(value);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+
+  /** Download the visible, filtered rows as CSV, in the board's own order. */
+  function exportCsv() {
+    var list = sortedRows(rows());
+    var lines = ['rank,name,slug,category,chains,tvl_usd,change_7d,age_days,implied_value_usd,watchlist'];
+    list.forEach(function (r) {
+      lines.push([
+        r.rank, csvCell(r.name), csvCell(r.slug), csvCell(r.category || 'Other'),
+        csvCell((r.chains || []).join(';')), r.tvl_usd,
+        r.change_7d === null ? '' : r.change_7d,
+        r.age_days === null ? '' : r.age_days, r.implied_value_usd,
+        r.is_watchlist ? 'yes' : 'no',
+      ].join(','));
+    });
+    var blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'token-radar-' + DATA.as_of + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  /** Copy text to the clipboard, with a textarea fallback for older browsers. */
+  function copyText(text, button) {
+    function done() {
+      var label = button.textContent;
+      button.textContent = 'Copied';
+      setTimeout(function () { button.textContent = label; }, 1500);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text); done(); });
+    } else {
+      fallbackCopy(text);
+      done();
+    }
+  }
+  function fallbackCopy(text) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    try { document.execCommand('copy'); } catch (e) { /* clipboard unavailable */ }
+    document.body.removeChild(area);
+  }
+
+  /** The current sort, in words, for the visible sort indicator. */
+  function sortLabel() {
+    var names = { rank: 'Rank', name: 'Protocol', tvl: 'TVL', growth: '7d growth', age: 'Age', implied: 'Implied value' };
+    var label = names[state.sort] || 'Implied value';
+    return 'Sorted by ' + label + ' ' + (state.dir < 0 ? 'high to low' : 'low to high');
+  }
+
   function header() {
     return el('header', { class: 'top' },
       el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { class: 'brand-name', text: 'Token Radar' })),
@@ -167,6 +229,9 @@
     );
     var pre = el('button', { type: 'button', 'aria-pressed': state.tab === 'pre-token' ? 'true' : 'false', text: 'Pre-token', onclick: function () { state.tab = 'pre-token'; render(); } });
     var live = el('button', { type: 'button', 'aria-pressed': state.tab === 'live' ? 'true' : 'false', text: 'Live token', onclick: function () { state.tab = 'live'; render(); } });
+    var csv = el('button', { class: 'button', type: 'button', text: 'Export CSV', onclick: function () { exportCsv(); } });
+    csv.setAttribute('title', 'Download the rows shown, as a CSV file');
+    var sortNote = el('span', { class: 'count', text: sortLabel() });
     return el('div', { class: 'controls' },
       el('div', { class: 'field' }, el('label', { for: 'q', text: 'Search' }), search),
       el('div', { class: 'field' }, el('label', { for: 'category', text: 'Category' }), select),
@@ -174,17 +239,24 @@
       el('div', { class: 'field' }, el('label', { for: 'minTvl', text: 'Min TVL' }), tvlSelect),
       watchBox,
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), el('div', { class: 'tabs' }, pre, live)),
+      csv,
+      sortNote,
       el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' : DATA.live.length + ' live-token protocols' })
     );
   }
 
   function sortHeader(key, label) {
-    return el('th', { scope: 'col' },
+    var active = state.sort === key;
+    var arrow = active ? (state.dir < 0 ? ' \u2193' : ' \u2191') : '';
+    var th = el('th', { scope: 'col' },
       el('button', { type: 'button', onclick: function () { if (state.sort === key) state.dir = -state.dir; else { state.sort = key; state.dir = -1; } render(); } },
-        label,
-        state.sort === key ? el('span', { 'aria-hidden': 'true', text: state.dir < 0 ? ' v' : ' ^' }) : null
+        label + arrow,
+        active ? el('span', { class: 'sort-ind', 'aria-hidden': 'true', text: state.dir < 0 ? 'high to low' : 'low to high' }) : null
       )
     );
+    if (active) th.setAttribute('aria-sort', state.dir < 0 ? 'descending' : 'ascending');
+    th.setAttribute('title', active ? sortLabel() : 'Sort by ' + label);
+    return th;
   }
 
   function boardTable() {
@@ -324,10 +396,17 @@
       scoreBar('Growth', row.growth_score),
       scoreBar('Age', row.age_score),
       scoreBar('Breadth', row.breadth_score),
+      el('p', { class: 'sub', text: 'Category context, computed from the snapshot at run time: this protocol\'s TVL is ' + (row.tvl_vs_category_median === undefined ? 'n/a' : row.tvl_vs_category_median + 'x') + ' the median TVL of the ' + (row.category_protocol_count === undefined ? 'n/a' : row.category_protocol_count) + ' protocols in its category (median ' + fmtUsd(row.category_median_tvl_usd) + '). The calibration describes the category; it does not change the score above.' }),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price, and it records no token — never that the protocol has none.' })
     ));
+    var copyBtn = el('button', { class: 'button', type: 'button', text: 'Copy farm plan' });
+    copyBtn.addEventListener('click', function () {
+      var plan = (row.farm_steps || []).map(function (s, i) { return (i + 1) + '. ' + s; }).join('\n');
+      copyText(row.name + ' — farm plan (Token Radar, snapshot ' + DATA.as_of + ')\n' + plan, copyBtn);
+    });
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),
+      copyBtn,
       el('ol', { class: 'steps' }, (row.farm_steps || []).map(function (s) {
         var at = s.indexOf(' Cost: ');
         var action = at >= 0 ? s.slice(0, at) : s;
